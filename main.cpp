@@ -23,7 +23,7 @@ public:
      * @brief Parsing status
      * VALID - the request string parsed successfuly, the request can be handled safely.
      * INCOMPLETE - the request line/headers are incomplete. Re-run the request with parse() and more data.
-     * BODY_INCOMPLETE - the request line/headers are complete. Re-run the request with parse_body() only.
+     * BODY_INCOMPLETE - the request line/headers are complete. Re-run the request with parse_body() and more data.
      * MALFORMED - the string and request are malformed and should be discarded.
      * UNSUPORTED - the parser does not recognize the requested http version.
      */
@@ -220,14 +220,18 @@ public:
     int status_code;
     string reason;
     std::map<string, string> headers;
-    int body_len;
-    char *body;
+    int body_len = 0;
+    char *body = nullptr;
     Response(int response_fd, string version, int status_code, string reason)
     {
         this->response_fd = response_fd;
         this->version = version;
         this->status_code = status_code;
         this->reason = reason;
+    }
+    static Response genericOK(int response_fd)
+    {
+        return Response(response_fd, "HTTP/1.1", 200, "OK");
     }
     static Response tooLarge(int response_fd)
     {
@@ -244,17 +248,36 @@ public:
     string toString()
     {
         string responce = version + " " + std::to_string(status_code) + " " + reason + "\r\n";
-        for(auto iter = headers.begin(); iter != headers.end(); ++iter)
+        for(auto iter = headers.begin(); iter != headers.end(); iter++)
         {
             responce += iter->first + ": " + iter->second + "\r\n";
         }
         responce += "\r\n";
+        if(body != nullptr)
+            responce += body;
         return responce;
+    }
+    void addHTML(string text)
+    {
+        clearBody();
+        body_len = text.length();
+        headers["Content-Type"] = "text/html; charset=UTF-8";
+        headers["Content-Length"] = std::to_string(body_len);
+        body = new char[body_len + 1];
+        memccpy(body, text.c_str(), 1, text.length());
+        body[body_len] = '\0';
+    }
+    void clearBody()
+    {
+        if(body == nullptr)
+            return;
+        delete body;
+        body_len = 0;
     }
     void respond()
     {
         string text = toString();
-        std::cout << text;
+        std::cout << text.substr(0, text.find("\r\n\r\n") + 4);
         send(response_fd, text.c_str(), text.length(), 0);
     }
 };
@@ -271,13 +294,13 @@ class HTTPServer
             loop();
     }
 public:
-    static const short poll_events = POLLIN | POLLPRI | POLLHUP;   // polling event mask
-                                                            //pollin = ready to read; anything else = the socket should be closed
+    // polling event mask; pollin = ready to read; anything else = the socket should be closed
+    static const short poll_events = POLLIN | POLLPRI | POLLHUP;
     int server_socket; // the listening socket file descriptor
     sockaddr_in server_address; // internet address object, default IPv4 0.0.0.0:8080
-    std::unordered_map<int, Client*> clients; // client file descriptors
+    std::unordered_map<int, Client*> clients; // file descriptor - client pair
     std::list<Request*> requests;
-    pollfd polls[10];
+    pollfd polls[16];
     int poll_cnt;
     bool running = false;
     std::mutex stopped;
@@ -289,7 +312,7 @@ public:
         int i = 1;
         for(auto iter = clients.begin(); iter != clients.end(); iter++)
         {
-            if(i >= 10)
+            if(i >= 16)
                 break;
             polls[i++] = {iter->second->socket_fd, poll_events, 0};
         }
@@ -305,6 +328,19 @@ public:
     {
         server_socket = socket(AF_INET, SOCK_STREAM, 0); // TCP IP with "custom" protocol
     
+        if (server_socket < 0) {
+            std::cerr << "Error creating socket!" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        // Allow the socket to be reusable immediately after closing
+        int opt = 1;
+        if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            std::cerr << "Error setting SO_REUSEADDR option!" << std::endl;
+            close(server_socket);
+            exit(EXIT_FAILURE);
+        }
+
         server_address.sin_family = AF_INET;
         server_address.sin_port = htons(port);
         server_address.sin_addr.s_addr = INADDR_ANY;
@@ -314,13 +350,12 @@ public:
      * @brief Start handling of clients
      * 
      */
-    void begin()
+    void start()
     {
-        stopped.lock();
         if(running)
         {
-            stopped.unlock();
-            return;
+            std::cout<<"Server already running"<<"\n";
+            return; // err state
         }
         running = true;
         if(bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) != 0)
@@ -335,7 +370,7 @@ public:
         }
         std::thread thread(&HTTPServer::loop_wrap, this);
         std::cout<<"Server initialized successfuly"<<"\n";
-        thread.detach();
+        thread.join();
     }
 
     void end()
@@ -376,8 +411,10 @@ public:
         for(auto iter = requests.begin(); iter != requests.end(); ++iter)
         {
             Request& request = (**iter);
-            std::cout << "Responce to " << request.response_fd << ": " << request.text;
-            send(request.response_fd, request.text.c_str(), request.text.length(), 0); //delete request
+            std::cout << "Responding to " << request.response_fd << ": " << request.text;
+            Response response = Response::genericOK(request.response_fd);
+            response.addHTML("Hello world!");
+            response.respond();
             if(request.headers["Connection"] == "close")
                 removeClient(request.response_fd);
         }
@@ -439,8 +476,6 @@ public:
 int main(void)
 {
     HTTPServer myServer;
-    myServer.begin();
-    string a;
-    std::cin>>a;
+    myServer.start();
     myServer.end();
 }
